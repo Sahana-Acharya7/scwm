@@ -1,36 +1,52 @@
 import os
 import io
 import json
+import re
 import uvicorn
-import mysql.connector
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from PIL import Image
 from ultralytics import YOLO
-from google import genai
+from groq import Groq
+from supabase import create_client
 
-# --- 1. CONFIGURATION ---
-load_dotenv() 
+# -------------------------------------------------
+# 1. CONFIGURATION
+# -------------------------------------------------
 
-# A. Configure Gemini (Only for advice, not detection)
-GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY")
-gemini_client = None
-if GEMINI_API_KEY:
+load_dotenv()
+
+# --- Supabase (HTTPS-based, no ports, no DNS issues)
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+print("✅ Supabase Client Connected (HTTPS)")
+
+# --- Groq AI
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+groq_client = None
+
+if GROQ_API_KEY:
     try:
-        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    except:
-        pass
+        groq_client = Groq(api_key=GROQ_API_KEY)
+        print("✅ Groq AI Client Connected")
+    except Exception as e:
+        print(f"⚠️ Groq Client Error: {e}")
 
-# B. Configure YOLO (Your Custom Model)
+# --- YOLO Model
 try:
-    # Load YOUR trained model
-    model = YOLO("best.pt") 
-    print("✅ Custom YOLO Model (best.pt) Loaded Successfully!")
+    model = YOLO("best.pt")
+    print("✅ Custom YOLO Model (best.pt) Loaded")
 except Exception as e:
-    print(f"❌ Error loading best.pt: {e}")
-    print("   Make sure 'best.pt' is in the backend folder.")
+    print(f"❌ YOLO Load Error: {e}")
     model = None
+
+# -------------------------------------------------
+# 2. FASTAPI APP
+# -------------------------------------------------
 
 app = FastAPI(title="Smart Construction Waste Manager")
 
@@ -42,164 +58,136 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def get_db_connection():
+# -------------------------------------------------
+# 3. GROQ SCIENTIFIC ANALYSIS
+# -------------------------------------------------
+
+def get_recycling_insight(waste_type: str):
+    if not groq_client:
+        return {
+            "status": "Manual Review",
+            "advice": "Segregate the material and follow local recycling guidelines.",
+            "fact": "Proper segregation improves recycling efficiency by 30–50%."
+        }
+
     try:
-        return mysql.connector.connect(
-            host=os.getenv("DB_HOST"),
-            user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASS"),
-            database=os.getenv("DB_NAME"),
-            port=int(os.getenv("DB_PORT"))
+        prompt = f"""
+        Act as a Senior Material Scientist and Civil Engineer.
+        Analyze the construction material: '{waste_type}'.
+
+        Return a valid JSON object with exactly three keys:
+        1. status (max 4 words)
+        2. advice (50–70 words, reusable/recyclable method)
+        3. fact (40–60 words with numbers on environmental impact)
+
+        Return ONLY raw JSON.
+        """
+
+        response = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.3-70b-versatile",
+            response_format={"type": "json_object"}
         )
+
+        raw = response.choices[0].message.content.strip()
+
+        if raw.startswith("```"):
+            raw = re.sub(r"^```json|^```|```$", "", raw).strip()
+
+        return json.loads(raw)
+
     except Exception as e:
-        print(f"❌ DB Connection Error: {e}")
-        return None
+        print(f"Groq Error: {e}")
+        return {
+            "status": "Recyclable",
+            "advice": f"{waste_type} can generally be recycled after cleaning and segregation.",
+            "fact": f"Recycling {waste_type} can reduce embodied carbon by 40–60%."
+        }
 
-# --- 2. HELPER: GET ADVICE ---
-def get_recycling_advice(waste_type):
-    """Uses Gemini to generate advice based on YOLO's detection"""
-    if not gemini_client:
-        return "Recycle according to local construction guidelines."
-    
-    try:
-        response = gemini_client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=f"Give me 2 short sentences on how to recycle construction waste of type: {waste_type}."
-        )
-        return response.text.strip()
-    except:
-        return "Standard recovery protocol applies."
-
-# --- 3. API ENDPOINTS ---
+# -------------------------------------------------
+# 4. API ENDPOINTS
+# -------------------------------------------------
 
 @app.post("/analyze")
 async def analyze_image(file: UploadFile = File(...)):
     if not model:
-        raise HTTPException(status_code=500, detail="YOLO Model not loaded. Check server logs.")
+        raise HTTPException(status_code=500, detail="YOLO model not loaded")
 
-    # 1. Read Image
-    contents = await file.read()
-    image = Image.open(io.BytesIO(contents))
+    # Read image
+    image_bytes = await file.read()
+    image = Image.open(io.BytesIO(image_bytes))
 
-    # 2. Run YOLO Inference (The "Prediction" step)
-    print("🤖 Running best.pt inference...")
+    # YOLO inference
     results = model(image)
-    
-    # 3. Process Results
     detected_class = "Unknown"
     confidence = 0.0
-    
-    # Get the object with highest confidence
-    if len(results) > 0 and len(results[0].boxes) > 0:
+
+    if results and results[0].boxes:
         box = results[0].boxes[0]
-        class_id = int(box.cls[0])
-        detected_class = model.names[class_id] # e.g., "Concrete"
+        detected_class = model.names[int(box.cls[0])]
         confidence = float(box.conf[0])
-    
-    print(f"✅ YOLO Detected: {detected_class} ({confidence:.2f})")
 
-    # 4. Get Advice (Optional, from Gemini)
-    advice = get_recycling_advice(detected_class)
+    print(f"✅ Detected: {detected_class}")
 
-    # 5. Save to AWS Database
+    # Groq analysis
+    insight = get_recycling_insight(detected_class)
+
+    # Save to Supabase
     try:
-        conn = get_db_connection()
-        if conn:
-            cursor = conn.cursor()
-            query = "INSERT INTO scans (waste_type, confidence, gemini_advice) VALUES (%s, %s, %s)"
-            cursor.execute(query, (detected_class, confidence, advice))
-            conn.commit()
-            scan_id = cursor.lastrowid
-            cursor.close()
-            conn.close()
-            return {
-                "scan_id": scan_id,
-                "waste_type": detected_class,
-                "confidence": confidence,
-                "advice": advice
-            }
+        response = supabase.table("scans").insert({
+            "waste_type": detected_class,
+            "confidence": confidence,
+            "gemini_advice": insight.get("advice")
+        }).execute()
+
+        scan_id = response.data[0]["id"]
+
+        return {
+            "scan_id": scan_id,
+            "waste_type": detected_class,
+            "confidence": confidence,
+            "status": insight.get("status"),
+            "advice": insight.get("advice"),
+            "fact": insight.get("fact")
+        }
+
     except Exception as e:
-        print(f"⚠️ DB Save Error: {e}")
-    
-    return {
-        "waste_type": detected_class,
-        "confidence": confidence,
-        "advice": advice,
-        "note": "Data not saved to DB due to connection error"
-    }
-
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-# --- PHASE 4 UPDATES ---
-
-@app.get("/centers")
-def get_recycling_centers():
-    """Fetch all recycling centers from AWS RDS"""
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return []
-        
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT name, address, latitude, longitude, contact_info FROM recycling_centers")
-        centers = cursor.fetchall()
-        
-        cursor.close()
-        conn.close()
-        return centers
-    except Exception as e:
-        print(f"Error fetching centers: {e}")
-        return []
+        print(f"⚠️ Supabase Insert Error: {e}")
+        return {
+            "waste_type": detected_class,
+            "confidence": confidence,
+            "status": insight.get("status"),
+            "advice": insight.get("advice"),
+            "fact": insight.get("fact")
+        }
 
 @app.get("/history")
 def get_scan_history():
-    """Fetch last 10 scans"""
     try:
-        conn = get_db_connection()
-        if not conn:
-            return []
-        
-        cursor = conn.cursor(dictionary=True)
-        # Order by newest first
-        cursor.execute("SELECT id, waste_type, confidence, timestamp, gemini_advice FROM scans ORDER BY id DESC LIMIT 10")
-        history = cursor.fetchall()
-        
-        cursor.close()
-        conn.close()
-        return history
+        result = supabase.table("scans") \
+            .select("*") \
+            .order("id", desc=True) \
+            .limit(10) \
+            .execute()
+        return result.data
     except Exception as e:
-        print(f"Error fetching history: {e}")
+        print(f"⚠️ History Error: {e}")
         return []
 
-# --- HEALTH CHECK ENDPOINT ---
-@app.get("/health")
-def check_data_connectivity():
-    """
-    Robust health check: Validates actual SQL execution.
-    """
+@app.get("/centers")
+def get_recycling_centers():
     try:
-        # 1. Attempt to connect
-        conn = get_db_connection()
-        if not conn:
-            raise HTTPException(status_code=503, detail="Database Connection Failed")
-        
-        # 2. Attempt to run a real query
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1")
-        result = cursor.fetchone()
-        
-        # 3. Clean up
-        cursor.close()
-        conn.close()
-        
-        return {
-            "status": "online", 
-            "database": "AWS RDS (MySQL)", 
-            "data_flow": "active", 
-            "query_result": result[0]
-        }
-        
+        result = supabase.table("recycling_centers") \
+            .select("name,address,latitude,longitude,contact_info") \
+            .execute()
+        return result.data
     except Exception as e:
-        print(f"❌ Connectivity Error: {e}")
-        raise HTTPException(status_code=500, detail=f"Data Connectivity Error: {str(e)}")
+        print(f"⚠️ Centers Error: {e}")
+        return []
+
+# -------------------------------------------------
+# 5. RUN SERVER
+# -------------------------------------------------
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

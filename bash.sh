@@ -1,50 +1,29 @@
-cat > backend/gemini_service.py <<'EOF'
-# -*- coding: utf-8 -*-
-import os
-import google.generativeai as genai
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from dotenv import load_dotenv
+#!/bin/bash
 
-load_dotenv()
+echo "🧹 Starting SCWM cleanup..."
 
-app = Flask(__name__)
-CORS(app) # Allows your React frontend to talk to this API
+# Backend cleanup
+echo "🔻 Removing old backend files..."
 
-# 1. Configure Gemini
-# Ensure your .env file has: GEMINI_API_KEY=your_actual_key_here
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel('gemini-1.5-flash')
+rm -rf backend/venv
 
-@app.route('/api/gemini-advice', methods=['POST'])
-def get_advice():
-    try:
-        data = request.json
-        material = data.get('material', 'unknown')
-        location = data.get('city', 'India')
+rm -f backend/init_db.py
+rm -f backend/createdb.py
+rm -f backend/seed_bengaluru.py
+rm -f backend/seed_centers_final.py
+rm -f backend/append_bengaluru.py
 
-        # 2. Futuristic Prompt Engineering
-        prompt = f"""
-        Role: Futuristic Sustainability AI Architect.
-        Context: Construction & Demolition (C&D) waste management in {location}.
-        Target Material: {material}.
-        
-        Task: Provide a high-tech, actionable recycling protocol (max 45 words).
-        Focus on: Industrial reuse, carbon offset potential, or recovery tech.
-        Tone: Cyberpunk, clinical, and innovative. 
-        Start with 'ANALYSIS:'
-        """
+# Optional: remove python cache if present
+rm -rf backend/__pycache__
 
-        response = model.generate_content(prompt)
-        
-        return jsonify({
-            "advice": response.text.strip(),
-            "status": "NEURAL_LINK_ACTIVE"
-        })
+echo "✅ Cleanup completed successfully."
 
-    except Exception as e:
-        return jsonify({"advice": f"System Error: {str(e)}", "status": "LINK_OFFLINE"}), 500
+echo "📌 Kept files:"
+echo "  - backend/main.py"
+echo "  - backend/supabase-client.py"
+echo "  - backend/gemini_service.py (if used)"
+echo "  - backend/requirements.txt"
+echo "  - backend/.env (ignored by git)"
+echo "  - backend/best.pt (ignored by git)"
 
-if __name__ == "__main__":
-    app.run(port=5001, debug=True)
-EOF
+echo "🚀 You are ready to commit and push to GitHub!"
